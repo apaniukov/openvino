@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <regex>
 #include <vector>
 #include <cassert>
 
@@ -473,11 +474,52 @@ public:
     }
 
     bool evaluate(ov::TensorVector& outputs, const ov::TensorVector& inputs) const {
-        return evaluate_helper(this, outputs, inputs);
+         std::vector<std::shared_ptr<ov::opset1::Constant>> results;
+
+
+        if(inputs.size() == 1 && inputs[0].get_shape().size() == 1) {
+            // Scalar str implementation represented as 1d/u8
+            auto in = inputs[0];
+
+            std::cerr << "in.get_shape() = " << in.get_shape() << "\n";
+            //auto out = HostTensor();
+            auto str_input = std::string(reinterpret_cast<const char*>(in.data()), in.get_shape()[0]);
+            auto str_output = evaluate_single(str_input);
+            results.push_back(make_shared<ov::opset1::Constant>(element::u8, Shape{str_output.length()}, str_output.data()));
+        } else {
+            auto begins = reinterpret_cast<const int*>(inputs[0].data());    // i32
+            auto ends = reinterpret_cast<const int*>(inputs[1].data());    // i32
+            auto chars = reinterpret_cast<const char*>(inputs[2].data());    // u8
+            size_t size = inputs[0].get_shape()[0];
+
+            std::vector<int> new_begins, new_ends;
+            std::string new_chars;
+
+            for(size_t i = 0; i < size; ++i) {
+                auto str_input = std::string(chars + begins[i], chars + ends[i]);
+                std::cerr << "Input string " << i << " is " << str_input << "\n";
+                auto str_output = evaluate_single(str_input);
+                std::cerr << "Output string " << i << " is " << str_output << "\n";
+                new_begins.push_back(new_chars.length());
+                new_chars += str_output;
+                new_ends.push_back(new_chars.length());
+            }
+
+            results.push_back(make_shared<ov::opset1::Constant>(element::i32, Shape{size}, &new_begins[0]));
+            results.push_back(make_shared<ov::opset1::Constant>(element::i32, Shape{size}, &new_ends[0]));
+            results.push_back(make_shared<ov::opset1::Constant>(element::u8, Shape{new_chars.length()}, new_chars.data()));
+        }
+
+        for(size_t i = 0; i < results.size(); ++i) {
+            size_t length = results[i]->get_byte_size();
+            std::cerr << "Expected length " << length << ", allocated: " << outputs[i].get_shape() << "\n";
+            memcpy(outputs[i].data(), results[i]->get_data_ptr(), length);
+        }
+        return true;
     }
 
     std::string evaluate_single(const std::string& input) const {
-        return "StaticRegexReplace(" + input + ", pattern = " + m_pattern + ", rewrite = " + m_rewrite + ")";
+        return std::regex_replace(input, m_regex, m_rewrite);
     }
 
     bool has_evaluate() const {
@@ -485,9 +527,9 @@ public:
     }
 
 private:
-
     std::string m_pattern;
     std::string m_rewrite;
+    std::regex m_regex = std::regex(m_pattern);
 };
 
 
@@ -547,34 +589,66 @@ public:
     ConstantVector evaluate_internal_helper(const ov::TensorVector& inputs) const {
         auto input = StructuralTypeProxy::TensorStr<const ov::TensorVector::value_type*>(&inputs[0], &inputs[1], &inputs[2]);
 
+        // Get regex strings
+        auto sep = std::string(reinterpret_cast<const char*>(inputs[3].data()), inputs[3].get_shape()[0]);
+        auto keep = std::string(reinterpret_cast<const char*>(inputs[4].data()), inputs[4].get_shape()[0]);
+
+        std::cerr << "Sep: " << sep << " Keep: " << keep << "\n";
+
+        const std::regex sep_regex(sep);
+        const std::regex keep_regex(keep);
+
         // We are supporting 1D inputs only, therefore we are making 2D ragged tensor
         size_t regular_size = input.get_shape()[0];
 
         // Parts of ragged representation
         std::vector<int> new_ragged_begins(regular_size), new_ragged_ends(regular_size);
         std::vector<int> new_str_begins, new_str_ends;
-        std::string new_chars;
 
+        size_t start_idx = 0, end_idx = 0;
         for(size_t i = 0; i < regular_size; ++i) {
             // Stub: synthetic processing
             std::string value = input.element_by_offset(i);
-            size_t part_size = 1;
-            size_t skip_size = 1;
-            size_t string_begin = 0;
+            std::cerr << "Input str: " << value << std::endl;
+
+            std::sregex_iterator end_it;
+            start_idx = end_idx;
+
             assert(new_str_begins.size() == new_str_ends.size());
             new_ragged_begins.push_back(new_str_begins.size());
-            while(string_begin < value.length()) {
-                std::string part = value.substr(string_begin, part_size);
-                new_str_begins.push_back(new_chars.length());
-                new_chars += part;
-                new_str_ends.push_back(new_chars.length());
-                string_begin += part_size + skip_size;
-                skip_size = 1 - skip_size;
-                ++part_size;
-                //std::cerr << "part: " << part << std::endl;
+
+            for (
+                std::sregex_iterator current_match(value.begin(), value.end(), sep_regex);
+                current_match != end_it;
+                ++current_match
+            ) {
+                end_idx = current_match->position();
+
+                new_str_begins.push_back(start_idx);
+                new_str_ends.push_back(end_idx);
+                start_idx = end_idx + current_match->length();
+
+                // Add strings that matches keep pattern
+                if (keep != "" && keep != "()"){
+                    for (
+                        std::sregex_iterator keep_match(value.begin() + end_idx, value.begin() + start_idx, keep_regex);
+                        keep_match != end_it;
+                        ++keep_match
+                    ) {
+                        new_str_begins.push_back(end_idx + keep_match->position());
+                        new_str_ends.push_back(end_idx + keep_match->position() + keep_match->length());
+                    }
+                }
             }
+
+            end_idx = value.length();
+            if (start_idx != end_idx) {
+                new_str_begins.push_back(start_idx);
+                new_str_ends.push_back(end_idx);
+            }
+
             assert(new_str_begins.size() == new_str_ends.size());
-            new_ragged_ends.push_back(new_str_begins.size());
+            new_ragged_ends.push_back(end_idx);
             assert(new_ragged_begins.size() == new_ragged_ends.size());
         }
 
@@ -583,7 +657,7 @@ public:
         results.push_back(make_shared<ov::opset1::Constant>(element::i32, Shape{regular_size}, &new_ragged_ends[0]));
         results.push_back(make_shared<ov::opset1::Constant>(element::i32, Shape{new_str_begins.size()}, &new_str_begins[0]));
         results.push_back(make_shared<ov::opset1::Constant>(element::i32, Shape{new_str_ends.size()}, &new_str_ends[0]));
-        results.push_back(make_shared<ov::opset1::Constant>(element::u8, Shape{new_chars.length()}, new_chars.data()));
+        results.push_back(make_shared<ov::opset1::Constant>(element::u8, inputs[2].get_shape(), inputs[2].data()));
 
         return results;
     }
