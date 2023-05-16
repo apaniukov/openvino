@@ -11,9 +11,9 @@ from openvino.runtime.exceptions import OVTypeError
 from .tokenizer_pipeline import (
     TokenizerPipeline,
     NormalizationStep,
-    UnicodeNormalizationStep,
+    NormalizeUnicode,
     NMTNormalizationStep,
-    LowercaseStep,
+    CaseFoldStep,
     RegExpNormalizationStep,
     StripStringStep,
     PreTokenizatinStep,
@@ -21,11 +21,9 @@ from .tokenizer_pipeline import (
     RegExpSplitStep,
     WhitespaceSplitStep,
     WordPieceTokenizationStep,
-    AddTokenStep,
-    SequenceStep,
     TruncationStep,
-    AddPaddingStep,
-    PostTokenizationStep,
+    PaddingStep,
+    CombineSegmentsStep,
 )
 
 
@@ -38,10 +36,10 @@ def parse_replace_normalizer(normalizer_dict: Dict[str, Any]) -> RegExpNormaliza
 
 
 def parse_bert_normalizer(normalizer_dict: Dict[str, Any]) -> List[NormalizationStep]:
-    steps: List[NormalizationStep] = [UnicodeNormalizationStep("NFD")]
+    steps: List[NormalizationStep] = [NormalizeUnicode("NFD")]
 
     if normalizer_dict["lowercase"] is True:
-        steps.append(LowercaseStep())
+        steps.append(CaseFoldStep())
 
     if normalizer_dict["clean_text"] is True:
         steps.append(RegExpNormalizationStep.del_control_chars_regex())
@@ -83,6 +81,7 @@ class TransformersTokenizerPipelineParser:
 
     def parse(self, number_of_inputs: Optional[int] = None) -> TokenizerPipeline:
         self.number_of_inputs = self.number_of_inputs if number_of_inputs is None else number_of_inputs
+        self.pipeline.number_of_inputs = self.number_of_inputs
         for add_steps in [
             self.normalization,
             self.pre_tokenization,
@@ -94,12 +93,12 @@ class TransformersTokenizerPipelineParser:
         return self.pipeline
 
     normalizers_map: Dict[str, Callable[[Dict[str, Any]], Union[NormalizationStep, List[NormalizationStep]]]] = {
-        "NFC": lambda step_dict: UnicodeNormalizationStep("NFC"),
-        "NFD": lambda step_dict: UnicodeNormalizationStep("NFD"),
-        "NFKC": lambda step_dict: UnicodeNormalizationStep("NFKC"),
-        "NFKD": lambda step_dict: UnicodeNormalizationStep("NFKD"),
+        "NFC": lambda step_dict: NormalizeUnicode("NFC"),
+        "NFD": lambda step_dict: NormalizeUnicode("NFD"),
+        "NFKC": lambda step_dict: NormalizeUnicode("NFKC"),
+        "NFKD": lambda step_dict: NormalizeUnicode("NFKD"),
         "Nmt": lambda step_dict: NMTNormalizationStep(),
-        "Lowercase": lambda step_dict: LowercaseStep(),
+        "Lowercase": lambda step_dict: CaseFoldStep(),
         "StripAccents": lambda step_dict: RegExpNormalizationStep.strip_accents_regex(),
         "BertNormalizer": parse_bert_normalizer,
         "Replace": parse_replace_normalizer,
@@ -158,63 +157,23 @@ class TransformersTokenizerPipelineParser:
             return
 
         if self.tokenizer_json["post_processor"]["type"] == "TemplateProcessing":
-            self.parse_template_postprocessor()
+            combine_segments_step = CombineSegmentsStep.from_hf_json_template_postprocessor(
+                self.tokenizer_json, self.number_of_inputs
+            )
         elif self.tokenizer_json["post_processor"]["type"] == "BertProcessing":
-            self.parse_bert_postprocessor()
+            combine_segments_step = CombineSegmentsStep.from_hf_json_bert_postprocessor(
+                self.tokenizer_json, self.number_of_inputs
+            )
         else:
             raise OVTypeError(f"Post-processor type '{self.tokenizer_json['post_processor']['type']}' is not supported")
 
+        self.num_of_added_tokens += combine_segments_step.number_of_added_tokens
+        combine_segments_step.set_tokens_ids(self.pipeline.vocab)
+
+        self.add_truncation()
+        self.pipeline.add_steps(combine_segments_step)
+
         self.add_padding()
-
-    def parse_template_postprocessor(self) -> None:
-        add_tokens_steps: List[PostTokenizationStep] = []
-        if self.number_of_inputs == 1:
-            post_processor = self.tokenizer_json["post_processor"]["single"]
-        else:
-            post_processor = self.tokenizer_json["post_processor"]["pair"]
-        for template_dict in post_processor:
-            if "SpecialToken" in template_dict:
-                self.num_of_added_tokens += 1
-                step = AddTokenStep(
-                    token=template_dict["SpecialToken"]["id"],
-                    token_type_id=template_dict["SpecialToken"]["type_id"],
-                )
-                step.set_pipeline(self.pipeline)
-                add_tokens_steps.append(step)
-            else:
-                add_tokens_steps.append(SequenceStep(token_type_id=template_dict["Sequence"]["type_id"]))
-        self.add_truncation()
-        self.pipeline.add_steps(add_tokens_steps)
-
-    def parse_bert_postprocessor(self) -> None:
-        #  [CLS] input [SEP] for one input and [CLS] input_1 [SEP] input_2 [SEP] for two inputs
-        self.num_of_added_tokens = self.number_of_inputs + 1
-        self.add_truncation()
-
-        post_processor_dict = self.tokenizer_json["post_processor"]
-        self.pipeline.add_steps(
-            [
-                AddTokenStep(
-                    token=post_processor_dict["cls"][0],
-                    token_type_id=0,
-                ),
-                SequenceStep(token_type_id=0),
-                AddTokenStep(
-                    token=post_processor_dict["sep"][0],
-                    token_type_id=0,
-                ),
-            ],
-        )
-        if self.number_of_inputs == 2:
-            self.pipeline.add_steps(
-                [
-                    SequenceStep(token_type_id=1),
-                    AddTokenStep(
-                        token=post_processor_dict["sep"][0],
-                        token_type_id=1,
-                    ),
-                ],
-            )
 
     def add_truncation(self) -> None:
         if self.tokenizer_json["truncation"] is not None:
@@ -224,4 +183,7 @@ class TransformersTokenizerPipelineParser:
 
     def add_padding(self) -> None:
         if self.tokenizer_json["padding"] is not None:
-            self.pipeline.add_steps(AddPaddingStep.from_hf_json(self.tokenizer_json))
+            self.pipeline.add_steps(PaddingStep.from_hf_json(self.tokenizer_json))
+        else:
+            self.pipeline.add_steps(PaddingStep(token=self.original_tokenizer.pad_token))
+        self.pipeline[-1].set_token_id(self.pipeline.vocab)
