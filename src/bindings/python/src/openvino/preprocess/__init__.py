@@ -30,3 +30,4 @@ from openvino._pyopenvino.preprocess import ColorFormat
 from openvino._pyopenvino.preprocess import ResizeAlgorithm
 
 from .tokenizers.convert_tokenizer import convert_tokenizer
+from .tokenizers.convert_tokenizer import apply_tokenizer
