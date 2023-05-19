@@ -103,16 +103,16 @@ class CaseFoldStep(NormalizationStep):
 
 
 @dataclass
-class RegExpNormalizationStep(NormalizationStep):
+class RegexNormalizationStep(NormalizationStep):
     regex_search_pattern: str
     replace_term: str
 
     @classmethod
-    def strip_accents_regex(cls) -> "RegExpNormalizationStep":
+    def strip_accents_regex(cls) -> "RegexNormalizationStep":
         return cls(regex_search_pattern=r"\p{Mn}", replace_term="")
 
     @classmethod
-    def del_control_chars_regex(cls) -> "RegExpNormalizationStep":
+    def del_control_chars_regex(cls) -> "RegexNormalizationStep":
         return cls(regex_search_pattern=r"\p{Cc}|\p{Cf}", replace_term=" ")
 
     def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
@@ -139,13 +139,13 @@ class NMTNormalizationStep(NormalizationStep):
 @dataclass
 class StripAccentsStep(NormalizationStep):
     def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
-        return RegExpNormalizationStep.strip_accents_regex().get_ov_subgraph(input_nodes)
+        return RegexNormalizationStep.strip_accents_regex().get_ov_subgraph(input_nodes)
 
 
 @dataclass
 class DelControlCharsStep(NormalizationStep):
     def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
-        return RegExpNormalizationStep.del_control_chars_regex().get_ov_subgraph(input_nodes)
+        return RegexNormalizationStep.del_control_chars_regex().get_ov_subgraph(input_nodes)
 
 
 @dataclass

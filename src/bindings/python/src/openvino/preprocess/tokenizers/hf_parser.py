@@ -14,7 +14,7 @@ from .tokenizer_pipeline import (
     NormalizeUnicode,
     NMTNormalizationStep,
     CaseFoldStep,
-    RegExpNormalizationStep,
+    RegexNormalizationStep,
     StripStringStep,
     PreTokenizatinStep,
     PunctuationSplitStep,
@@ -27,9 +27,9 @@ from .tokenizer_pipeline import (
 )
 
 
-def parse_replace_normalizer(normalizer_dict: Dict[str, Any]) -> RegExpNormalizationStep:
+def parse_replace_normalizer(normalizer_dict: Dict[str, Any]) -> RegexNormalizationStep:
     regex_search_pattern = normalizer_dict["pattern"].get("String") or normalizer_dict["pattern"]["Regex"]
-    return RegExpNormalizationStep(
+    return RegexNormalizationStep(
         regex_search_pattern=regex_search_pattern,
         replace_term=normalizer_dict["content"],
     )
@@ -42,10 +42,10 @@ def parse_bert_normalizer(normalizer_dict: Dict[str, Any]) -> List[Normalization
         steps.append(CaseFoldStep())
 
     if normalizer_dict["clean_text"] is True:
-        steps.append(RegExpNormalizationStep.del_control_chars_regex())
+        steps.append(RegexNormalizationStep.del_control_chars_regex())
 
     if normalizer_dict["strip_accents"] is True:
-        steps.append(RegExpNormalizationStep.strip_accents_regex())
+        steps.append(RegexNormalizationStep.strip_accents_regex())
 
     return steps
 
@@ -99,7 +99,7 @@ class TransformersTokenizerPipelineParser:
         "NFKD": lambda step_dict: NormalizeUnicode("NFKD"),
         "Nmt": lambda step_dict: NMTNormalizationStep(),
         "Lowercase": lambda step_dict: CaseFoldStep(),
-        "StripAccents": lambda step_dict: RegExpNormalizationStep.strip_accents_regex(),
+        "StripAccents": lambda step_dict: RegexNormalizationStep.strip_accents_regex(),
         "BertNormalizer": parse_bert_normalizer,
         "Replace": parse_replace_normalizer,
         "Strip": parse_strip_step,
