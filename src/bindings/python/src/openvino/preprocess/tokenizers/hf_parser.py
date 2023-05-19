@@ -18,7 +18,7 @@ from .tokenizer_pipeline import (
     StripStringStep,
     PreTokenizatinStep,
     PunctuationSplitStep,
-    RegExpSplitStep,
+    RegexSplitStep,
     WhitespaceSplitStep,
     WordPieceTokenizationStep,
     TruncationStep,
@@ -57,9 +57,9 @@ def parse_strip_step(split_dict: Dict[str, Any]) -> StripStringStep:
     )
 
 
-def parse_split_step(pretokenizer_dict: Dict[str, Any]) -> RegExpSplitStep:
+def parse_split_step(pretokenizer_dict: Dict[str, Any]) -> RegexSplitStep:
     split_pattern = pretokenizer_dict["pattern"].get("String") or pretokenizer_dict["pattern"]["Regex"]
-    return RegExpSplitStep(
+    return RegexSplitStep(
         split_pattern=split_pattern,
         invert=pretokenizer_dict["invert"],
         behaviour=pretokenizer_dict["behavior"],
@@ -122,8 +122,8 @@ class TransformersTokenizerPipelineParser:
             self.parse_normalizer_step(self.tokenizer_json["normalizer"])
 
     pre_tokenization_map: Dict[str, Callable[[Dict[str, Any]], Union[PreTokenizatinStep, List[PreTokenizatinStep]]]] = {
-        "BertPreTokenizer": lambda step_dict: RegExpSplitStep.bert_splitter(),
-        "Whitespace": lambda step_dict: RegExpSplitStep.whitespace_splitter(),
+        "BertPreTokenizer": lambda step_dict: RegexSplitStep.bert_splitter(),
+        "Whitespace": lambda step_dict: RegexSplitStep.whitespace_splitter(),
         "WhitespaceSplit": lambda step_dict: WhitespaceSplitStep(),
         "Split": parse_split_step,
         "Punctuation": lambda step_dict: PunctuationSplitStep(step_dict["behavior"]),

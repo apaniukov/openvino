@@ -1,28 +1,45 @@
 # -*- coding: utf-8 -*-
-# Copyright (C) 2018-2022 Intel Corporation
+# Copyright (C) 2018-2023 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
-
+import os
 from dataclasses import dataclass, field
 from functools import singledispatchmethod
 from typing import List, Optional, Any, Dict
 from unittest.mock import MagicMock
+import weakref
+
+import numpy as np
 
 from openvino.runtime.exceptions import UserInputError, OVTypeError
-from openvino.runtime import Type, Shape, PartialShape, op, Model
+from openvino.runtime import Type, PartialShape, op, Model, Core, Output, Node
 from openvino.runtime.utils.types import as_node
-
-import weakref
 
 
 string_ops = MagicMock()
 
 
-def string_to_bytes(value) -> bytes:
-    return [byte for byte in bytes(value, 'utf-8')]
+def pack_strings(strings):
+    assert isinstance(strings, list)
+    to_bytes = lambda x: x.to_bytes(4, "little")
+    batch_size = len(strings)
+    if batch_size == 0:
+        return to_bytes(0)
+    offsets = to_bytes(0)
+    symbols = bytes()
+    for s in strings:
+        symbols += bytes(s, "utf-8")
+        offsets += to_bytes(len(symbols))
+    return np.frombuffer(bytearray(to_bytes(batch_size) + offsets + symbols), np.uint8)
 
 
-def pack_strings(values: List[str]):
-    return string_to_bytes(values[0])
+def pack_string(s):
+    return np.frombuffer(
+        bytes(s + " ", "utf-8"), dtype=np.uint8
+    )  # + ' ' is WA for CPU bug
+
+
+core = Core()
+core.add_extension(os.getenv("USER_OV_EXTENSION_SO_PATH"))
 
 
 @dataclass
@@ -49,26 +66,20 @@ class BasePipelineStep:
     def set_pipeline(self, pipeline: "TokenizerPipeline") -> None:
         self._pipeline = weakref.ref(pipeline)
 
-    def get_ov_subgraph(self, *input_nodes):
+    def get_ov_subgraph(self, *input_nodes: List[Output]) -> Node:
         raise NotImplementedError
 
     @staticmethod
     def create_string_constant_node(value: str) -> op.Constant:
-        data = string_to_bytes(value)
-        return op.Constant(
-            Type.u8,
-            Shape([len(data)]),
-            data
-        )
+        if isinstance(value, str):
+            # string scalar
+            ps = pack_string(value)
+            return op.Constant(ps)
+        else:
+            # support only 1D strings for now
+            ps = pack_strings(value)
+            return core.make_node("StringTensorUnpack", op.Constant(ps).outputs())
 
-    @staticmethod
-    def create_list_of_strings_constant_node(values: List[str]) -> op.Constant:
-        data = pack_strings(values)
-        return op.Constant(
-            Type.u8,
-            Shape([len(data)]),
-            data,
-        )
 
 @dataclass
 class NormalizationStep(BasePipelineStep):
@@ -79,22 +90,16 @@ class NormalizationStep(BasePipelineStep):
 class NormalizeUnicode(NormalizationStep):
     normalization_form: str = "NFD"
 
-    def get_ov_subgraph(self, *input_nodes) -> "NormalizeUnicode":
-        return string_ops.NormalizeUnicodeWithOffsets(*input_nodes, self.normalization_form)
-
-
-@dataclass
-class NMTNormalizationStep(NormalizationStep):
-    """Normaization based on NMT task.
-
-    https://github.com/huggingface/tokenizers/blob/28cd3dce2a75d106572392194ff2564574c33235/tokenizers/src/normalizers/unicode.rs#L44
-    """
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        return core.make_node(
+            "NormalizeUnicode", input_nodes, {"normalization_form": self.normalization_form}
+        )
 
 
 @dataclass
 class CaseFoldStep(NormalizationStep):
-    def get_ov_subgraph(self, *input_nodes) -> "CaseFoldStep":
-        return string_ops.CaseFold(*input_nodes)
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        return core.make_node("CaseFold", input_nodes)
 
 
 @dataclass
@@ -110,25 +115,37 @@ class RegExpNormalizationStep(NormalizationStep):
     def del_control_chars_regex(cls) -> "RegExpNormalizationStep":
         return cls(regex_search_pattern=r"\p{Cc}|\p{Cf}", replace_term=" ")
 
-    def get_ov_subgraph(self, *input_nodes) -> "RegExpNormalizationStep":
-
-        return string_ops.RegExpNormalization(
-            *input_nodes,
-            self.create_string_constant_node(self.regex_search_pattern),
-            self.create_string_constant_node(self.replace_term),
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        input_nodes.extend(
+            (
+                *self.create_string_constant_node("search_pattern").outputs(),
+                *self.create_string_constant_node("replace_pattern").outputs(),
+            )
+        )
+        return core.make_node(
+            "RegexNormalization",
+            input_nodes
         )
 
 
 @dataclass
+class NMTNormalizationStep(NormalizationStep):
+    """Normaization based on NMT task.
+
+    https://github.com/huggingface/tokenizers/blob/28cd3dce2a75d106572392194ff2564574c33235/tokenizers/src/normalizers/unicode.rs#L44
+    """
+
+
+@dataclass
 class StripAccentsStep(NormalizationStep):
-    def get_ov_subgraph(self, *input_nodes) -> "RegExpNormalizationStep":
-        return RegExpNormalizationStep.strip_accents_regex().get_ov_subgraph(*input_nodes)
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        return RegExpNormalizationStep.strip_accents_regex().get_ov_subgraph(input_nodes)
 
 
 @dataclass
 class DelControlCharsStep(NormalizationStep):
-    def get_ov_subgraph(self, *input_nodes) -> "RegExpNormalizationStep":
-        return RegExpNormalizationStep.del_control_chars_regex().get_ov_subgraph(*input_nodes)
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        return RegExpNormalizationStep.del_control_chars_regex().get_ov_subgraph(input_nodes)
 
 
 @dataclass
@@ -143,13 +160,13 @@ class PreTokenizatinStep(BasePipelineStep):
 
 
 @dataclass
-class RegExpSplitStep(PreTokenizatinStep):
+class RegexSplitStep(PreTokenizatinStep):
     split_pattern: str
     invert: bool = False
     behaviour: str = "Remove"
 
     @classmethod
-    def bert_splitter(cls) -> "RegExpSplitStep":
+    def bert_splitter(cls) -> "RegexSplitStep":
         """Generates a step with a standard BERT regex.
 
         The source:
@@ -185,30 +202,34 @@ class RegExpSplitStep(PreTokenizatinStep):
         )
 
     @classmethod
-    def whitespace_splitter(cls) -> "RegExpSplitStep":
+    def whitespace_splitter(cls) -> "RegexSplitStep":
         return cls(r"\w+|[^\w\s]+")
 
-    def get_ov_subgraph(self, *input_nodes) -> "RegExpNormalizationStep":
-        return string_ops.RegExpSplit(
-            *input_nodes,
-            self.create_string_constant_node(self.split_pattern),
-            self.behaviour,
-            self.invert,
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        input_nodes.extend(
+            self.create_string_constant_node(self.split_pattern).outputs()
+        )
+        return core.make_node(
+            "RegexSplit",
+            input_nodes,
+            {
+                "behaviour": self.behaviour,
+                "invert": self.invert,
+            },
         )
 
 
 @dataclass
 class WhitespaceSplitStep(PreTokenizatinStep):
     """Works like python `str.split`."""
-    def get_ov_subgraph(self, *input_nodes) -> "RegExpNormalizationStep":
-        return RegExpSplitStep.whitespace_splitter().get_ov_subgraph(*input_nodes)
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> List[Output]:
+        return RegexSplitStep.whitespace_splitter().get_ov_subgraph(input_nodes)
 
 
 @dataclass
 class PunctuationSplitStep(PreTokenizatinStep):
     """Splits string on punctuation chars."""
-
-    behaviour: str = "Isolated"
+    # behaviour: str = "Isolated"
 
 
 @dataclass
@@ -242,13 +263,20 @@ class WordPieceTokenizationStep(TokenizationModelStep):
             vocab=[token for token, index in sorted(tokenizer_json["model"]["vocab"].items(), key=lambda x: x[1])],
         )
 
-    def get_ov_subgraph(self, *input_nodes):
-        return string_ops.WordPieceTokenization(
-            *input_nodes,
-            self.create_list_of_strings_constant_node(self.vocab),
-            as_node(self.unk_token_id),
-            self.suffix_indicator,
-            self.max_bytes_per_word,
+    def get_ov_subgraph(self, input_nodes: List[Output]) -> Node:
+        input_nodes.extend(
+            (
+                *self.create_string_constant_node(self.vocab).outputs(),
+                *as_node(self.unk_token_id).outputs(),
+            )
+        )
+        return core.make_node(
+            "WordpieceTokenizer",
+            input_nodes,
+            {
+                "suffix_indicator": self.suffix_indicator,
+                "max_bytes_per_word": self.max_bytes_per_word,
+            }
         )
 
 
@@ -277,7 +305,7 @@ class TruncationStep(PostTokenizationStep):
             truncate_right=tokenizer.truncation_side == "right",
         )
 
-    def get_ov_subgraph(self, *input_nodes):
+    def get_ov_subgraph(self, input_nodes: List[Output]):
         operation = string_ops.Truncation(
             *input_nodes,
             as_node(self.max_length),
@@ -478,17 +506,18 @@ class TokenizerPipeline:
     def post_tokenization_steps(self) -> List[PostTokenizationStep]:
         return [step for step in self.steps if isinstance(step, PostTokenizationStep)]
 
-    @staticmethod
-    def create_string_input():
+    def create_string_input(self) -> Node:
         return op.Parameter(Type.u8, PartialShape(["?"]))
 
-    def create_processing_pipeline(self, input_nodes: List[op.Parameter]) -> List[string_ops]:
+    def create_processing_pipeline(self, input_nodes: List[op.Parameter]) -> List[Node]:
         processing_pipelines_outputs = []
 
         for input_node in input_nodes:
+            input_node = core.make_node("StringTensorUnpack", input_node.outputs()).outputs()
             for step in self.processing_steps:
-                input_node = step.get_ov_subgraph(input_node)
-            processing_pipelines_outputs.append(input_node)
+                input_node = step.get_ov_subgraph(input_node).outputs()
+            ragged_tensor_pack = core.make_node("RaggedTensorPack", input_node)
+            processing_pipelines_outputs.append(ragged_tensor_pack)
 
         return processing_pipelines_outputs
 
@@ -511,7 +540,9 @@ class TokenizerPipeline:
     def get_ov_subgraph(self) -> Model:
         input_nodes = [self.create_string_input() for _ in range(self.number_of_inputs)]
         processing_outputs = self.create_processing_pipeline(input_nodes)
-        outputs = self.create_post_tokenization_pipeline(processing_outputs)
-        print(string_ops.method_calls)
-        # return Model(outputs, input_nodes, name="tokenizer")
-        return outputs, input_nodes
+        # outputs = self.create_post_tokenization_pipeline(processing_outputs)
+
+        return Model(processing_outputs, input_nodes, name="tokenizer")
+
+
+
