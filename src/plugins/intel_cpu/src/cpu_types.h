@@ -141,6 +141,7 @@ enum class Type : uint8_t {
     GatherMatmul,
     GatedDeltaNet,
     PagedGatedDeltaNet
+    PagedCausalConv1D
 };
 
 enum class Algorithm : uint8_t {
