@@ -266,7 +266,7 @@ static const TypeToNameMap& get_type_to_name_tbl() {
         {"BatchGatherMatmulCompressed", Type::GatherMatmul},
         {"GatedDeltaNet", Type::GatedDeltaNet},
         {"PagedCausalConv1D", Type::PagedCausalConv1D},
-        {"PagedGatedDeltaNet", Type::PagedGatedDeltaNet};
+        {"PagedGatedDeltaNet", Type::PagedGatedDeltaNet}};
     return type_to_name_tbl;
 }
 
