@@ -30,6 +30,7 @@
 #include "openvino/pass/manager.hpp"
 #include "openvino/pass/pattern/matcher.hpp"
 #include "openvino/pass/pattern/op/wrap_type.hpp"
+#include "transformations/rt_info/keep_const_precision.hpp"
 
 using ov::pass::pattern::any_input;
 using ov::pass::pattern::wrap_type;
@@ -87,7 +88,7 @@ std::string make_gated_delta_state_table_name(const size_t layer_index) {
 
 ov::PartialShape make_gated_delta_state_table_shape(const ov::PartialShape& state_shape) {
     if (state_shape.rank().is_static() && state_shape.rank().get_length() == 4) {
-        return ov::PartialShape{ov::Dimension::dynamic(), state_shape[1], state_shape[2], state_shape[3]};
+        return ov::PartialShape{ov::Dimension::dynamic(), state_shape[1], state_shape[3], state_shape[2]};
     }
     return ov::PartialShape::dynamic(4);
 }
@@ -102,10 +103,11 @@ std::shared_ptr<ov::Node> find_upstream_gdn_state_source(const std::shared_ptr<o
         if (ov::as_type_ptr<ov::op::util::ReadValueBase>(cur) || ov::as_type_ptr<v0::Parameter>(cur)) {
             return cur;
         }
-        // Only traverse single-input, shape-only ops that do not change tensor semantics.
+           // Follow lightweight layout ops and Gather(ReadValue, beam_idx, axis) wrappers
+           // to recover the underlying state source for table allocation.
         if ((ov::as_type_ptr<ov::op::v1::Reshape>(cur) || ov::as_type_ptr<ov::op::v0::Unsqueeze>(cur) ||
              ov::as_type_ptr<ov::op::v1::Transpose>(cur) || ov::as_type_ptr<ov::op::v8::Slice>(cur) ||
-             ov::as_type_ptr<ov::op::v0::Convert>(cur)) &&
+               ov::as_type_ptr<ov::op::v0::Convert>(cur) || ov::as_type_ptr<ov::op::v8::Gather>(cur)) &&
             cur->get_input_size() > 0) {
             cur = cur->get_input_node_shared_ptr(0);
         } else {
@@ -237,6 +239,9 @@ public:
                     make_gated_delta_state_table_name(m_state_to_state_table.size()),
                     state_table_source->get_output_element_type(0),
                     make_gated_delta_state_table_shape(state_table_source->get_output_partial_shape(0)));
+                if (state_table.created) {
+                    enable_keep_const_precision(state_table.parameter);
+                }
                 m_state_to_state_table[state_table_source] = state_table.parameter;
             }
 
