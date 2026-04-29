@@ -39,16 +39,31 @@ KERNEL(paged_causal_conv1d_ref)
     const int blk_begin = block_indices_begins[seq];
     const int blk_end = block_indices_begins[seq + 1];
 
-    if (token_begin < 0 || token_end < token_begin || blk_end <= blk_begin)
+    if (token_begin < 0 || token_end <= token_begin)
         return;
 
+    const int seq_tokens = token_end - token_begin;
     const int block_span = blk_end - blk_begin;
-    if (block_span <= 1)
+
+    if (blk_end <= blk_begin || block_span <= 1) {
+        for (int t = 0; t < seq_tokens; t++) {
+            const int out_off = (token_begin + t) * output_token_stride + h * output_hidden_stride;
+            output_embeds[out_off] = TO_OUTPUT_TYPE(0.0f);
+        }
         return;
+    }
 
     const int read_physical_block = block_indices[blk_begin];
-    if (read_physical_block < 0 || read_physical_block >= num_blocks)
+    if (read_physical_block < 0 || read_physical_block >= num_blocks) {
+        for (int t = 0; t < seq_tokens; t++) {
+            const int out_off = (token_begin + t) * output_token_stride + h * output_hidden_stride;
+            output_embeds[out_off] = TO_OUTPUT_TYPE(0.0f);
+        }
         return;
+    }
+
+    const int seq_interval = cache_interval[seq];
+    const int prev_nums = (seq_interval > 0) ? (past_lens[seq] % seq_interval) : 0;
 
     float state[KERNEL_SIZE];
 
@@ -62,7 +77,7 @@ KERNEL(paged_causal_conv1d_ref)
     bias_val = convert_float(conv_bias[h * bias_hidden_stride]);
 #endif
 
-    for (int t = 0; t < token_end - token_begin; t++) {
+    for (int t = 0; t < seq_tokens; t++) {
         const int token_idx = token_begin + t;
 
         for (int k = 0; k + 1 < KERNEL_SIZE; k++) {
@@ -81,39 +96,20 @@ KERNEL(paged_causal_conv1d_ref)
         const int out_off = token_idx * output_token_stride + h * output_hidden_stride;
         output_embeds[out_off] = TO_OUTPUT_TYPE(sum);
 
-        const int interval = cache_interval[seq];
-        if (interval > 0) {
-            const int processed_tokens = t + 1;
-            if ((processed_tokens % interval) == 0) {
-                const int logical_block = (processed_tokens + interval - 1) / interval;
-                if (logical_block >= 1 && logical_block < block_span) {
-                    const int physical_block = block_indices[blk_begin + logical_block];
-                    if (physical_block >= 0 && physical_block < num_blocks) {
-                        const int state_base = physical_block * state_block_stride + h * state_hidden_stride;
-                        for (int k = 0; k < KERNEL_SIZE; k++) {
-                            conv_state_table[state_base + k * state_kernel_stride] = TO_INPUT1_TYPE(state[k]);
-                        }
+        const int cached_tokens = prev_nums + (t + 1);
+        const int interval_hit = (seq_interval > 0) && ((cached_tokens % seq_interval) == 0);
+        const int is_last_token = (t == seq_tokens - 1);
+        if (interval_hit || is_last_token) {
+            const int slot = (seq_interval > 0) ? (1 + (cached_tokens - 1) / seq_interval) : 1;
+            if (slot >= 1 && slot < block_span) {
+                const int physical_block = block_indices[blk_begin + slot];
+                if (physical_block >= 0 && physical_block < num_blocks) {
+                    const int state_base = physical_block * state_block_stride + h * state_hidden_stride;
+                    for (int k = 0; k < KERNEL_SIZE; k++) {
+                        conv_state_table[state_base + k * state_kernel_stride] = TO_INPUT1_TYPE(state[k]);
                     }
                 }
             }
-        }
-    }
-
-    const int seq_tokens = token_end - token_begin;
-    const int interval = cache_interval[seq];
-    int final_logical_block = 1;
-    if (interval > 0) {
-        final_logical_block = (seq_tokens + interval - 1) / interval;
-    }
-    if (final_logical_block >= block_span) {
-        final_logical_block = block_span - 1;
-    }
-
-    const int final_physical_block = block_indices[blk_begin + final_logical_block];
-    if (final_physical_block >= 0 && final_physical_block < num_blocks) {
-        const int final_state_base = final_physical_block * state_block_stride + h * state_hidden_stride;
-        for (int k = 0; k < KERNEL_SIZE; k++) {
-            conv_state_table[final_state_base + k * state_kernel_stride] = TO_INPUT1_TYPE(state[k]);
         }
     }
 }

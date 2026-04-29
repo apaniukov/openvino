@@ -8,6 +8,7 @@
 #include <oneapi/dnnl/dnnl_common.hpp>
 #include <string>
 
+#include "cpu_memory.h"
 #include "cpu_types.h"
 #include "graph_context.h"
 #include "node.h"
@@ -23,7 +24,7 @@ public:
 
     void getSupportedDescriptors() override {}
     void initSupportedPrimitiveDescriptors() override;
-    void createPrimitive() override {}
+    void createPrimitive() override;
     void execute(const dnnl::stream& strm) override;
     void executeDynamicImpl(const dnnl::stream& strm) override {
         execute(strm);
@@ -33,9 +34,25 @@ public:
         return getType() == Type::PagedCausalConv1D;
     }
 
+    // conv_bias (port 3) may have zero dimension when bias is absent
+    bool neverExecute() const override {
+        return getSelectedPrimitiveDescriptor()->hasZeroInputDimsAtPort(0);
+    }
+
+    // conv_bias (port 3) may have zero dimension when bias is absent
+    bool isExecutable() const override {
+        return !isInputTensorAtPortEmpty(0);
+    }
+
     bool needPrepareParams() const override {
         return false;
     }
+
+private:
+    // Per-node f32 scratch buffer holding one promoted conv-state block (hidden_size * kernel_size
+    // floats). Allocated once via the plugin scratchpad in createPrimitive() so that repeated
+    // execute() calls avoid per-invocation heap allocation.
+    MemoryPtr m_tmpLocalState;
 };
 
 }  // namespace ov::intel_cpu::node
