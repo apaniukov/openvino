@@ -7650,27 +7650,22 @@ std::shared_ptr<ov::Model> make_pa_model() {
         auto q_to_pa =
             makeOP<v1::Reshape>({makeOP<v1::Transpose>({query, {0l, 2l, 1l, 3l}}), {0l, -1l}}, {special_zero_true});
 
-        // The last cached token is read back as K/V and fed as the current one.
         auto past_lens_minus_one = makeOP<v1::Subtract>({past_lens, 1}, {numpy_broadcast});
-        auto block_size = makeOP<v8::Gather>({makeOP<v3::ShapeOf>({value_cache}, {{"output_type", "i32"}}), 2, 0},
-                                             {{"batch_dims", 0}});
-        auto begins = makeOP<v8::Slice>({block_indices_begins, {0}, {-1}, {1}, {0}});
-        auto block_in_seq =
-            makeOP<v1::Divide>({past_lens_minus_one, block_size}, {numpy_broadcast, {"m_pythondiv", true}});
-        auto block = makeOP<v8::Gather>({block_indices, makeOP<v1::Add>({begins, block_in_seq}, {numpy_broadcast}), 0},
-                                        {{"batch_dims", 0}});
-        auto slot = makeOP<v1::Mod>({past_lens_minus_one, block_size}, {numpy_broadcast});
-        auto read_last_token = [&](const std::shared_ptr<v0::Parameter>& cache) {
-            auto blocks = makeOP<v8::Gather>({cache, block, 0}, {{"batch_dims", 0}});
-            auto token = makeOP<v8::Gather>({blocks, slot, 2}, {{"batch_dims", 1}});
-            auto flat = makeOP<v1::Reshape>({token, makeConst(element::i64, ov::Shape{2}, {-1, head_size})},
-                                            {{"special_zero", false}});
-            return makeOP<v0::Convert>({flat}, {dest_type_f32});
+        auto unused_kv = [&]() {
+            auto token_count = makeOP<v8::Gather>(
+                {makeOP<v3::ShapeOf>({q_to_pa}, {{"output_type", "i64"}}), 0, 0},
+                {{"batch_dims", 0}});
+            auto shape = makeOP<v0::Concat>(
+                {makeOP<v0::Unsqueeze>({token_count, 0}),
+                 makeConst(element::i64, ov::Shape{1}, {head_size})},
+                {{"axis", 0}});
+            return makeOP<v3::Broadcast>({makeConst(element::f32, ov::Shape{}, {0}), shape},
+                                         {{"mode", "numpy"}});
         };
 
         OutputVector args{q_to_pa,
-                          read_last_token(key_cache),
-                          read_last_token(value_cache),
+                          unused_kv(),
+                          unused_kv(),
                           key_cache,
                           value_cache,
                           past_lens_minus_one,
@@ -7748,6 +7743,25 @@ TEST_F(SDPAToPATest, SDPAToPA_Gemma4MTP_Gemma4MTPStateManagementPattern) {
 
     comparator.disable(FunctionsComparator::PRECISIONS);
     disable_rt_info_check();
+}
+
+TEST(SDPAToPATestGemma4MTP, ReadOnlyCacheDoesNotExtractQuantizedKV) {
+    auto model = gemma4_mtp::make_sdpa_model();
+    gemma4_mtp::run_pass(model);
+    size_t cache_inputs = 0;
+    for (const auto& parameter : model->get_parameters()) {
+        const std::string name = parameter->get_friendly_name();
+        if (name.find("key_cache.") != 0 && name.find("value_cache.") != 0) {
+            continue;
+        }
+        ++cache_inputs;
+        for (const auto& target : parameter->output(0).get_target_inputs()) {
+            auto pa = ov::as_type_ptr<ov::op::PagedAttentionExtension>(target.get_node()->shared_from_this());
+            ASSERT_NE(pa, nullptr);
+            EXPECT_FALSE(pa->get_write_kv_cache());
+        }
+    }
+    EXPECT_EQ(cache_inputs, 4u);
 }
 
 /*

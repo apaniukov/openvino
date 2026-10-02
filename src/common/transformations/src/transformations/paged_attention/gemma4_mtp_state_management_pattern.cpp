@@ -80,47 +80,18 @@ std::shared_ptr<ov::Node> kv_input_path(const std::shared_ptr<ov::Node>& kv_para
     return wrap_type<v1::Reshape>({broadcast, any_input()});
 }
 
-// Resolves the last cached token of every sequence to its (physical block, slot) through the block table
-std::pair<ov::Output<ov::Node>, ov::Output<ov::Node>> locate_last_token(
-    const ov::Output<ov::Node>& value_cache,
-    const ov::Output<ov::Node>& past_lens_minus_one,
-    const ov::Output<ov::Node>& block_indices,
-    const ov::Output<ov::Node>& block_indices_begins) {
-    using ov::element::i32;
-    auto axis_0 = v0::Constant::create(i32, ov::Shape{}, {0});
-    auto block_size =  // [] Bs
-        std::make_shared<v8::Gather>(std::make_shared<v3::ShapeOf>(value_cache, i32),
-                                     v0::Constant::create(i32, ov::Shape{}, {2}),
-                                     axis_0);
-    auto begins = std::make_shared<v8::Slice>(block_indices_begins,  // [B_seq + 1] -> [B_seq]
-                                              v0::Constant::create(i32, ov::Shape{1}, {0}),
-                                              v0::Constant::create(i32, ov::Shape{1}, {-1}),
-                                              v0::Constant::create(i32, ov::Shape{1}, {1}),
-                                              v0::Constant::create(i32, ov::Shape{1}, {0}));
-    auto physical_block_id = std::make_shared<v8::Gather>(  // [B_seq]: physical block id
-        block_indices,
-        std::make_shared<v1::Add>(begins, std::make_shared<v1::Divide>(past_lens_minus_one, block_size)),
-        axis_0);
-    auto slot = std::make_shared<v1::Mod>(past_lens_minus_one, block_size);  // [B_seq]: slot inside the block
-    return {physical_block_id, slot};
-}
-
-// Reads cache[block, :, slot, :] out of a [num_blocks, Hk, Bs, S] cache as [B_seq, Hk * S].
-std::shared_ptr<ov::Node> extract_last_token(const ov::Output<ov::Node>& cache,
-                                             const ov::Output<ov::Node>& physical_block_id,
-                                             const ov::Output<ov::Node>& slot,  // [B_seq]
-                                             int64_t width,
-                                             const ov::element::Type& type) {
-    using ov::element::i32;
-    using ov::element::i64;
-    auto blocks =  // [B_seq, Hk, Bs, S]
-        std::make_shared<v8::Gather>(cache, physical_block_id, v0::Constant::create(i32, ov::Shape{}, {0}));
-    auto token =
-        std::make_shared<v8::Gather>(blocks, slot, v0::Constant::create(i32, ov::Shape{}, {2}), 1);  // [B_seq, Hk, S]
-    auto flat = std::make_shared<v1::Reshape>(token,                                                 // [B_seq, Hk * S]
-                                              v0::Constant::create(i64, ov::Shape{2}, std::vector<int64_t>{-1, width}),
-                                              false);
-    return std::make_shared<v0::Convert>(flat, type);
+std::shared_ptr<ov::Node> unused_new_kv(const ov::Output<ov::Node>& query, int64_t width) {
+    auto token_count = std::make_shared<v8::Gather>(
+        std::make_shared<v3::ShapeOf>(query, ov::element::i64),
+        v0::Constant::create(ov::element::i64, ov::Shape{}, {0}),
+        v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    auto shape = std::make_shared<v0::Concat>(
+        OutputVector{std::make_shared<v0::Unsqueeze>(
+                         token_count, v0::Constant::create(ov::element::i64, ov::Shape{}, {0})),
+                     v0::Constant::create(ov::element::i64, ov::Shape{1}, {width})},
+        0);
+    return std::make_shared<v3::Broadcast>(
+        v0::Constant::create(query.get_element_type(), ov::Shape{}, {0}), shape);
 }
 
 }  // namespace
@@ -198,18 +169,10 @@ ov::pass::Gemma4MTPStateManagementPattern::Gemma4MTPStateManagementPattern(
         auto past_lens_minus_one = std::make_shared<v1::Subtract>(
             pa_params["past_lens"],
             v0::Constant::create(pa_params["past_lens"]->get_output_element_type(0), Shape{}, {1}));
-        auto [physical_block_id, slot] =
-            locate_last_token(v_cache_param, past_lens_minus_one, block_indices, block_indices_begins);
-        auto k_to_pa = extract_last_token(k_cache_param,
-                                          physical_block_id,
-                                          slot,
-                                          num_k_heads * k_head_size,
-                                          real_q.get_element_type());
-        auto v_to_pa = extract_last_token(v_cache_param,
-                                          physical_block_id,
-                                          slot,
-                                          num_v_heads * v_head_size,
-                                          real_q.get_element_type());
+        // Read-only PA consumes the entire prefix from cache; its new-token K/V inputs are unused.
+        // Quantized cache rows also contain scale metadata and cannot be read as plain K/V.
+        auto k_to_pa = unused_new_kv(q_to_pa, num_k_heads * k_head_size);
+        auto v_to_pa = unused_new_kv(q_to_pa, num_v_heads * v_head_size);
 
         std::shared_ptr<Node> scale;
         if (pattern_map.count(scale_input)) {
